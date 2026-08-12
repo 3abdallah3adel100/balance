@@ -53,7 +53,7 @@ if not check_password():
     st.stop()
 
 st.title("💰 Meta Budget & Balance Monitor")
-st.caption("Active Campaign Budget • Today Spend • Balance Coverage • WhatsApp Recharge Alerts")
+st.caption("Spending Campaign Budget • Today Spend • Balance Coverage • WhatsApp Recharge Alerts")
 
 meta_token = secret("META_ACCESS_TOKEN", "")
 meta_version = secret("META_API_VERSION", "v26.0")
@@ -88,7 +88,7 @@ with col2:
 
 if refresh:
     client = MetaClient(access_token=meta_token, api_version=meta_version)
-    with st.status("Fetching ad accounts, active budgets, today spend and balances...", expanded=True) as status:
+    with st.status("Fetching ad accounts, today spend, spending budgets and balances...", expanded=True) as status:
         try:
             accounts = client.get_ad_accounts()
             st.write(f"Ad accounts discovered: {len(accounts)}")
@@ -114,8 +114,8 @@ if not snapshot_df.empty:
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Spend Today", f"{total_spend:,.2f} EGP")
-    c2.metric("Active Daily Budget", f"{total_daily:,.2f} EGP")
-    c3.metric("Accounts with Active Budget", f"{active_accounts}")
+    c2.metric("Daily Budget (Spending)", f"{total_daily:,.2f} EGP")
+    c3.metric("Accounts with Spending Budget", f"{active_accounts}")
     c4.metric("Critical ≤ 1 Day", f"{critical_accounts}")
 
     if st.session_state["last_refresh"]:
@@ -139,10 +139,10 @@ if not snapshot_df.empty:
     ]
     st.dataframe(display[[c for c in cols if c in display.columns]], use_container_width=True, hide_index=True)
 
-    with st.expander("Active Budget Details (CBO / ABO)"):
+    with st.expander("Spending Budget Details (CBO / ABO)"):
         details = pd.DataFrame(st.session_state["budget_details"])
         if details.empty:
-            st.info("No active daily-budget items found.")
+            st.info("No spending daily-budget items found.")
         else:
             st.dataframe(details, use_container_width=True, hide_index=True)
 
@@ -212,8 +212,8 @@ if send:
 
 st.divider()
 st.caption(
-    "Budget rule: every ACTIVE campaign is counted. Campaign-level daily_budget wins; "
-    "otherwise ACTIVE ad-set daily budgets are summed. Today Spend does not require the campaign to still be active."
+    "Budget rule: only campaigns with Spend Today > 0 are counted, regardless of current status. "
+    "For CBO, campaign daily_budget is counted once. For ABO, only ad sets that spent today are summed."
 )
 st.caption(
     "Balance note: Meta documents the Ad Account 'balance' field as bill amount due. "

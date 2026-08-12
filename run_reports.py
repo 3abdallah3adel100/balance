@@ -7,16 +7,19 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-import config as app_config
-from config import (
-    AGENT_REPORT_RECIPIENTS,
-    OVERALL_REPORT_RECIPIENTS,
-)
+from config import AGENT_REPORT_RECIPIENTS, OVERALL_REPORT_RECIPIENTS
 
-# Safe defaults for GitHub Actions / headless execution.
-# These can optionally be overridden in config.py.
-AUTOMATION_TIMEZONE = getattr(app_config, "AUTOMATION_TIMEZONE", "Africa/Cairo")
-AUTOMATION_MAX_WORKERS = int(getattr(app_config, "AUTOMATION_MAX_WORKERS", 8))
+# Safe fallbacks so GitHub Actions does not fail if these optional values are
+# missing from config.py. This also lets you keep your current Allocation value.
+try:
+    from config import AUTOMATION_MAX_WORKERS
+except ImportError:
+    AUTOMATION_MAX_WORKERS = 8
+
+try:
+    from config import AUTOMATION_TIMEZONE
+except ImportError:
+    AUTOMATION_TIMEZONE = "Africa/Cairo"
 from meta_api import MetaClient, fetch_full_snapshot
 from reports import (
     build_agent_message_1,

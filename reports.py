@@ -49,31 +49,31 @@ def build_allocation_note(active_daily_budget: float, allocation_budget: float) 
 
     if abs_pct <= ALLOCATION_ALIGNED_TOLERANCE_PCT:
         return (
-            f"Active Daily Budget is aligned with Allocation Budget "
+            f"Daily Budget (spending campaigns) is aligned with Allocation Budget "
             f"({diff:+,.2f} EGP / {diff_pct:+.1f}%)."
         )
     if diff < 0 and abs_pct >= ALLOCATION_SIGNIFICANT_DIFF_PCT:
         return (
-            f"Active Daily Budget is significantly BELOW Allocation by "
+            f"Daily Budget (spending campaigns) is significantly BELOW Allocation by "
             f"{abs(diff):,.2f} EGP ({abs_pct:.1f}%)."
         )
     if diff < 0:
         return (
-            f"Active Daily Budget is below Allocation by "
+            f"Daily Budget (spending campaigns) is below Allocation by "
             f"{abs(diff):,.2f} EGP ({abs_pct:.1f}%)."
         )
     if abs_pct >= ALLOCATION_SIGNIFICANT_DIFF_PCT:
         return (
-            f"Active Daily Budget is significantly ABOVE Allocation by "
+            f"Daily Budget (spending campaigns) is significantly ABOVE Allocation by "
             f"{abs(diff):,.2f} EGP ({abs_pct:.1f}%)."
         )
     return (
-        f"Active Daily Budget is above Allocation by "
+        f"Daily Budget (spending campaigns) is above Allocation by "
         f"{abs(diff):,.2f} EGP ({abs_pct:.1f}%)."
     )
 
 
-def _active_agent_accounts(snapshot_df: pd.DataFrame, code: str) -> pd.DataFrame:
+def _spending_agent_accounts(snapshot_df: pd.DataFrame, code: str) -> pd.DataFrame:
     if snapshot_df.empty:
         return pd.DataFrame()
     df = snapshot_df[
@@ -85,12 +85,12 @@ def _active_agent_accounts(snapshot_df: pd.DataFrame, code: str) -> pd.DataFrame
 
 def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
     name = MEDIA_BUYER_MAP.get(code, code)
-    df = _active_agent_accounts(snapshot_df, code)
+    df = _spending_agent_accounts(snapshot_df, code)
     lines = [f"📊 *{name} ({code}) — Balance & Daily Budget*", ""]
 
     if df.empty:
-        lines.append("No ad accounts with active daily-budget campaigns were found.")
-        lines.extend(["", f"Overall Active Daily Budget for {name} ({code}): 0.00 EGP", "Overall Balance: 0.00 EGP"])
+        lines.append("No ad accounts with Spend Today > 0 and a daily budget were found.")
+        lines.extend(["", f"Overall Daily Budget for {name} ({code}): 0.00 EGP", "Overall Balance: 0.00 EGP"])
         return "\n".join(lines)
 
     for _, row in df.iterrows():
@@ -110,7 +110,7 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
         lines.extend([
             f"*Ad Account ID:* {row.get('account_id', '-')}",
             f"*Ad Account Name:* {row.get('account_name', '-')}",
-            f"*Active Daily Budget:* {money(daily_budget, row.get('currency', 'EGP'))}",
+            f"*Daily Budget:* {money(daily_budget, row.get('currency', 'EGP'))}",
             f"*Balance:* {money(balance, row.get('currency', 'EGP'))}",
             f"*Balance Coverage:* {days(coverage)}",
             f"*Alarm:* {alarm}",
@@ -121,7 +121,7 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
     overall_balance = pd.to_numeric(df["balance"], errors="coerce").fillna(0).sum()
     lines.extend([
         "──────────────",
-        f"*Overall Active Daily Budget for {name} ({code}):* {money(overall_budget)}",
+        f"*Overall Daily Budget for {name} ({code}):* {money(overall_budget)}",
         f"*Overall Balance:* {money(overall_balance)}",
     ])
     return "\n".join(lines).strip()
@@ -129,7 +129,7 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
 
 def build_agent_message_2(snapshot_df: pd.DataFrame, code: str) -> str:
     name = MEDIA_BUYER_MAP.get(code, code)
-    df = _active_agent_accounts(snapshot_df, code)
+    df = _spending_agent_accounts(snapshot_df, code)
     if not df.empty:
         coverage = pd.to_numeric(df["coverage_days"], errors="coerce")
         df = df[coverage <= CRITICAL_COVERAGE_DAYS].copy()
@@ -168,7 +168,7 @@ def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | N
         "📊 *Overall Budget Performance*",
         "",
         f"*Spend Today:* {money(total_spend)}",
-        f"*Active Daily Budget:* {money(total_daily)}",
+        f"*Daily Budget:* {money(total_daily)}",
         f"*Allocation Budget:* {money(allocation) if allocation > 0 else 'NOT CONFIGURED'}",
         f"*Spend vs Allocation:* {pct(spend_vs_allocation)}",
         f"*Remaining Allocation:* {money(remaining_allocation) if remaining_allocation is not None else 'N/A'}",
@@ -197,7 +197,7 @@ def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | N
         lines.extend([
             "",
             f"*{name} ({code})*",
-            f"Active Daily Budget: {money(daily)}",
+            f"Daily Budget: {money(daily)}",
             f"Spend Today: {money(spend)}",
             f"Spend vs Daily Budget: {pct(spend_vs_daily)}",
             f"Remaining vs Daily Budget: {money(remaining_daily)}",
