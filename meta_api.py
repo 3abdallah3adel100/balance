@@ -94,7 +94,7 @@ class MetaClient:
                 (f"business/{business_id}/client", f"{business_id}/client_ad_accounts", False),
             ])
 
-        fields = "id,account_id,name,account_status,currency,balance,amount_spent,spend_cap,funding_source_details"
+        fields = "id,account_id,name,account_status,currency,balance,amount_spent,spend_cap,funding_source_details,timezone_name,timezone_offset_hours_utc"
         for source_name, endpoint, is_me in sources:
             try:
                 rows = self.fetch_all_pages(endpoint, {"fields": fields, "limit": 500})
@@ -152,7 +152,7 @@ class MetaClient:
         params = {
             "fields": fields,
             # Same intent as the user's working Apps Script.
-            "effective_status": json.dumps(["ACTIVE"]),
+            "effective_status": "['ACTIVE']",
             "limit": limit,
         }
         try:
@@ -194,82 +194,144 @@ class MetaClient:
     def get_active_adsets(self, account_id: str) -> tuple[pd.DataFrame, list[str]]:
         return self._get_active_budget_entities(account_id, "adsets")
 
-    def get_entity_today_spend(self, entity_id: str, today: date | None = None) -> float:
-        """Exact equivalent of fetchTodaySpend(id) from the user's working Apps Script."""
+    def _today_params_exact(self, day: date) -> dict[str, Any]:
+        # Exact query style used by the working Google Apps Script:
+        # ?time_range[since]=YYYY-MM-DD&time_range[until]=YYYY-MM-DD
+        return {
+            "time_range[since]": day.isoformat(),
+            "time_range[until]": day.isoformat(),
+        }
+
+    def get_entity_today_spend_with_diagnostics(
+        self,
+        entity_id: str,
+        today: date | None = None,
+    ) -> tuple[float, str, int, str | None]:
+        """Fetch Campaign/Ad Set spend, matching the working Apps Script first.
+
+        Returns (spend, source, rows_count, error). Empty rows are NOT treated as
+        an API error; a date_preset=today fallback is tried before returning zero.
+        """
         day = today or date.today()
-        rows = self.fetch_all_pages(
-            f"{entity_id}/insights",
-            {
-                "fields": "spend",
-                "time_range": f'{{"since":"{day.isoformat()}","until":"{day.isoformat()}"}}',
-                "limit": 50,
-            },
-        )
-        if not rows:
-            return 0.0
-        return float(
-            pd.to_numeric(
-                pd.Series([row.get("spend", 0) for row in rows]),
-                errors="coerce",
-            ).fillna(0).sum()
-        )
+        exact_error: str | None = None
+        try:
+            params = {"fields": "spend,date_start,date_stop", "limit": 50, **self._today_params_exact(day)}
+            rows = self.fetch_all_pages(f"{entity_id}/insights", params)
+            if rows:
+                spend = float(pd.to_numeric(pd.Series([r.get("spend", 0) for r in rows]), errors="coerce").fillna(0).sum())
+                return spend, "entity_exact_time_range", len(rows), None
+        except Exception as exc:
+            exact_error = str(exc)
+
+        # Fallback uses Meta's own definition of "today" for the ad account.
+        try:
+            rows = self.fetch_all_pages(
+                f"{entity_id}/insights",
+                {"fields": "spend,date_start,date_stop", "date_preset": "today", "limit": 50},
+            )
+            if rows:
+                spend = float(pd.to_numeric(pd.Series([r.get("spend", 0) for r in rows]), errors="coerce").fillna(0).sum())
+                return spend, "entity_date_preset_today", len(rows), exact_error
+            return 0.0, "entity_no_rows", 0, exact_error
+        except Exception as fallback_exc:
+            combined = f"Exact time_range failed/empty: {exact_error or 'no rows'} | date_preset fallback: {fallback_exc}"
+            return 0.0, "entity_spend_error", 0, combined
+
+    def get_entity_today_spend(self, entity_id: str, today: date | None = None) -> float:
+        spend, _source, _rows, error = self.get_entity_today_spend_with_diagnostics(entity_id, today)
+        if error and _source == "entity_spend_error":
+            raise MetaAPIError(error)
+        return spend
+
+    def get_level_today_spend_map(
+        self,
+        account_id: str,
+        level: str,
+        today: date | None = None,
+    ) -> tuple[dict[str, float], str, int, str | None]:
+        """Get today's spend for every campaign/adset in one account-level Insights call.
+
+        This is a robust fallback to the per-entity calls used in the old Apps Script.
+        """
+        if level not in {"campaign", "adset"}:
+            raise ValueError("level must be campaign or adset")
+        clean_id = clean_account_id(account_id)
+        day = today or date.today()
+        id_field = "campaign_id" if level == "campaign" else "adset_id"
+        name_field = "campaign_name" if level == "campaign" else "adset_name"
+        fields = f"{id_field},{name_field},spend,date_start,date_stop"
+        if level == "adset":
+            fields = f"campaign_id,{fields}"
+        exact_error: str | None = None
+
+        def rows_to_map(rows: list[dict]) -> dict[str, float]:
+            out: dict[str, float] = {}
+            for row in rows:
+                entity_id = str(row.get(id_field) or "").strip()
+                if not entity_id:
+                    continue
+                out[entity_id] = out.get(entity_id, 0.0) + _money_float(row.get("spend"))
+            return out
+
+        try:
+            params = {
+                "fields": fields,
+                "level": level,
+                "limit": 2000,
+                **self._today_params_exact(day),
+            }
+            rows = self.fetch_all_pages(f"act_{clean_id}/insights", params)
+            if rows:
+                return rows_to_map(rows), f"account_{level}_exact_time_range", len(rows), None
+        except Exception as exc:
+            exact_error = str(exc)
+
+        try:
+            rows = self.fetch_all_pages(
+                f"act_{clean_id}/insights",
+                {"fields": fields, "level": level, "date_preset": "today", "limit": 2000},
+            )
+            if rows:
+                return rows_to_map(rows), f"account_{level}_date_preset_today", len(rows), exact_error
+            return {}, f"account_{level}_no_rows", 0, exact_error
+        except Exception as fallback_exc:
+            combined = f"{level} exact time_range failed/empty: {exact_error or 'no rows'} | date_preset fallback: {fallback_exc}"
+            return {}, f"account_{level}_spend_error", 0, combined
 
     def get_today_spend_with_diagnostics(
         self,
         account_id: str,
         today: date | None = None,
     ) -> tuple[float, str, str | None]:
-        """Fetch account spend like the working Apps Script, with a campaign-level fallback.
-
-        Primary query intentionally DOES NOT send level=account, matching:
-        act_<id>/insights?fields=spend&time_range[...]
-        """
         clean_id = clean_account_id(account_id)
         day = today or date.today()
-        time_range = f'{{"since":"{day.isoformat()}","until":"{day.isoformat()}"}}'
-        primary_error: str | None = None
+        exact_error: str | None = None
 
+        # Primary: exact same bracket-style date query as the working Apps Script.
         try:
             rows = self.fetch_all_pages(
                 f"act_{clean_id}/insights",
-                {"fields": "spend", "time_range": time_range, "limit": 50},
+                {"fields": "spend,date_start,date_stop", "limit": 50, **self._today_params_exact(day)},
             )
-            spend = float(
-                pd.to_numeric(
-                    pd.Series([row.get("spend", 0) for row in rows]),
-                    errors="coerce",
-                ).fillna(0).sum()
-            ) if rows else 0.0
-            if spend > 0:
-                return spend, "account_insights", None
+            if rows:
+                spend = float(pd.to_numeric(pd.Series([r.get("spend", 0) for r in rows]), errors="coerce").fillna(0).sum())
+                if spend > 0:
+                    return spend, "account_exact_time_range", None
         except Exception as exc:
-            primary_error = str(exc)
+            exact_error = str(exc)
 
-        # Diagnostic/fallback: campaign-level spend is non-overlapping when summed.
+        # Fallback: let Meta resolve "today" using the ad account timezone.
         try:
-            campaign_rows = self.fetch_all_pages(
+            rows = self.fetch_all_pages(
                 f"act_{clean_id}/insights",
-                {
-                    "fields": "spend,campaign_id,campaign_name",
-                    "level": "campaign",
-                    "time_range": time_range,
-                    "limit": 2000,
-                },
+                {"fields": "spend,date_start,date_stop", "date_preset": "today", "limit": 50},
             )
-            campaign_spend = float(
-                pd.to_numeric(
-                    pd.Series([row.get("spend", 0) for row in campaign_rows]),
-                    errors="coerce",
-                ).fillna(0).sum()
-            ) if campaign_rows else 0.0
-            if campaign_spend > 0:
-                msg = None
-                if primary_error:
-                    msg = f"Account-level spend failed; campaign-level fallback succeeded. Primary error: {primary_error}"
-                return campaign_spend, "campaign_level_fallback", msg
-            return 0.0, "no_spend_returned", primary_error
+            spend = float(pd.to_numeric(pd.Series([r.get("spend", 0) for r in rows]), errors="coerce").fillna(0).sum()) if rows else 0.0
+            if spend > 0:
+                return spend, "account_date_preset_today", exact_error
+            return 0.0, "no_spend_returned", exact_error
         except Exception as fallback_exc:
-            combined = f"Account spend failed/empty. Primary: {primary_error or 'no spend rows'} | Fallback: {fallback_exc}"
+            combined = f"Account exact time_range failed/empty: {exact_error or 'no rows'} | date_preset fallback: {fallback_exc}"
             return 0.0, "spend_error", combined
 
     def get_today_spend(self, account_id: str, today: date | None = None) -> float:
@@ -491,29 +553,7 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
             "error": str(exc),
         })
 
-    campaign_spend_by_id, campaign_spend_errors = _entity_spend_map(
-        client,
-        campaigns,
-        today=spend_date,
-        entity_label="campaign_spend",
-    )
-    adset_spend_by_id, adset_spend_errors = _entity_spend_map(
-        client,
-        adsets,
-        today=spend_date,
-        entity_label="adset_spend",
-    )
-    diagnostic_errors.extend(campaign_spend_errors)
-    diagnostic_errors.extend(adset_spend_errors)
-
-    daily_budget, campaign_daily_budget, adset_daily_budget, budget_details = calculate_account_daily_budget(
-        campaigns,
-        adsets,
-        campaign_spend_by_id,
-        adset_spend_by_id,
-        currency,
-    )
-
+    # 1) Account spend using the exact Apps Script date syntax first.
     spend_today, spend_source, spend_error = client.get_today_spend_with_diagnostics(
         account_id,
         today=spend_date,
@@ -525,6 +565,95 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
             "entity_name": account_name,
             "error": spend_error,
         })
+
+    # 2) Batch spend maps from account Insights. This is much more reliable than
+    # depending only on N separate object-level /insights calls.
+    campaign_spend_by_id, campaign_spend_source, campaign_spend_rows, campaign_batch_error = (
+        client.get_level_today_spend_map(account_id, "campaign", today=spend_date)
+    )
+    adset_spend_by_id, adset_spend_source, adset_spend_rows, adset_batch_error = (
+        client.get_level_today_spend_map(account_id, "adset", today=spend_date)
+    )
+    if campaign_batch_error and "no rows" not in campaign_batch_error.lower():
+        diagnostic_errors.append({
+            "entity_type": "campaign_spend_batch",
+            "entity_id": account_id,
+            "entity_name": account_name,
+            "error": campaign_batch_error,
+        })
+    if adset_batch_error and "no rows" not in adset_batch_error.lower():
+        diagnostic_errors.append({
+            "entity_type": "adset_spend_batch",
+            "entity_id": account_id,
+            "entity_name": account_name,
+            "error": adset_batch_error,
+        })
+
+    # 3) If the batch query did not find spend for active budget entities, fall
+    # back to the old Google-Sheets-style direct entity /insights query.
+    campaign_candidate_ids = set()
+    if not campaigns.empty:
+        for _, row in campaigns.iterrows():
+            if row.get("daily_budget") not in (None, "", 0, "0"):
+                campaign_candidate_ids.add(str(row.get("id") or ""))
+    adset_candidate_ids = set()
+    if not adsets.empty:
+        for _, row in adsets.iterrows():
+            if row.get("daily_budget") not in (None, "", 0, "0"):
+                adset_candidate_ids.add(str(row.get("id") or ""))
+
+    campaign_has_candidate_spend = any(
+        _money_float(campaign_spend_by_id.get(entity_id, 0)) > 0
+        for entity_id in campaign_candidate_ids
+    )
+    adset_has_candidate_spend = any(
+        _money_float(adset_spend_by_id.get(entity_id, 0)) > 0
+        for entity_id in adset_candidate_ids
+    )
+
+    if campaign_candidate_ids and not campaign_has_candidate_spend:
+        direct_map, direct_errors = _entity_spend_map(
+            client, campaigns, today=spend_date, entity_label="campaign_spend_direct"
+        )
+        if any(v > 0 for v in direct_map.values()):
+            campaign_spend_by_id.update(direct_map)
+            campaign_spend_source += "+direct_entity_fallback"
+        diagnostic_errors.extend(direct_errors)
+
+    if adset_candidate_ids and not adset_has_candidate_spend:
+        direct_map, direct_errors = _entity_spend_map(
+            client, adsets, today=spend_date, entity_label="adset_spend_direct"
+        )
+        if any(v > 0 for v in direct_map.values()):
+            adset_spend_by_id.update(direct_map)
+            adset_spend_source += "+direct_entity_fallback"
+        diagnostic_errors.extend(direct_errors)
+
+    # Reconstruct account spend if the account-level query is empty but lower
+    # levels clearly returned spend. Campaign level is non-overlapping, so prefer it.
+    campaign_total_spend = sum(_money_float(v) for v in campaign_spend_by_id.values())
+    adset_total_spend = sum(_money_float(v) for v in adset_spend_by_id.values())
+    if spend_today <= 0 and campaign_total_spend > 0:
+        spend_today = campaign_total_spend
+        spend_source = "reconstructed_from_campaign_insights"
+    elif spend_today <= 0 and adset_total_spend > 0:
+        spend_today = adset_total_spend
+        spend_source = "reconstructed_from_adset_insights"
+
+    daily_budget, campaign_daily_budget, adset_daily_budget, budget_details = calculate_account_daily_budget(
+        campaigns,
+        adsets,
+        campaign_spend_by_id,
+        adset_spend_by_id,
+        currency,
+    )
+
+    # A positive account spend with no spend found at campaign/adset level is
+    # suspicious. Surface it explicitly instead of pretending the budget is zero.
+    if spend_today > 0 and not budget_details:
+        warnings.append(
+            "Account has Spend Today > 0 but no ACTIVE Campaign/Ad Set with both daily_budget and spend was found."
+        )
 
     coverage_days = balance / daily_budget if balance is not None and daily_budget > 0 else None
     required_for_3_days = max(0.0, daily_budget * 3.0 - balance) if balance is not None and daily_budget > 0 else None
@@ -549,6 +678,12 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         "media_buyer": buyer_name(buyer_code),
         "spend_today": spend_today,
         "spend_source": spend_source,
+        "campaign_spend_source": campaign_spend_source,
+        "campaign_spend_rows": campaign_spend_rows,
+        "adset_spend_source": adset_spend_source,
+        "adset_spend_rows": adset_spend_rows,
+        "timezone_name": str(account_row.get("timezone_name") or ""),
+        "timezone_offset_hours_utc": account_row.get("timezone_offset_hours_utc"),
         "campaign_daily_budget": campaign_daily_budget,
         "adset_daily_budget": adset_daily_budget,
         "active_daily_budget": daily_budget,  # kept for report compatibility

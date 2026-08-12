@@ -135,7 +135,9 @@ if not snapshot_df.empty:
     st.subheader("Ad Accounts")
     cols = [
         "buyer_code", "media_buyer", "account_id", "account_name", "currency",
-        "spend_today", "spend_source", "campaign_daily_budget", "adset_daily_budget",
+        "spend_today", "spend_source", "campaign_spend_source", "campaign_spend_rows",
+        "adset_spend_source", "adset_spend_rows", "timezone_name",
+        "campaign_daily_budget", "adset_daily_budget",
         "active_daily_budget", "balance", "coverage_days", "required_for_3_days",
         "active_campaigns_checked", "campaigns_with_spend", "active_adsets_checked",
         "adsets_with_spend", "balance_source", "active_budget_items", "fetch_status",

@@ -142,11 +142,15 @@ def main() -> int:
             f"campaign_budget={float(row.get('campaign_daily_budget') or 0):,.2f} | "
             f"adset_budget={float(row.get('adset_daily_budget') or 0):,.2f} | "
             f"total_budget={float(row.get('active_daily_budget') or 0):,.2f} | "
+            f"campaign_spend_source={row.get('campaign_spend_source', '-')} rows={row.get('campaign_spend_rows', 0)} | "
+            f"adset_spend_source={row.get('adset_spend_source', '-')} rows={row.get('adset_spend_rows', 0)} | "
+            f"timezone={row.get('timezone_name', '-') or '-'} | "
             f"active_campaigns={row.get('active_campaigns_checked', 0)} "
             f"campaigns_spent={row.get('campaigns_with_spend', 0)} | "
             f"active_adsets={row.get('active_adsets_checked', 0)} "
             f"adsets_spent={row.get('adsets_with_spend', 0)} | "
-            f"fetch_status={row.get('fetch_status', '-')} | errors={row.get('error_count', 0)}"
+            f"fetch_status={row.get('fetch_status', '-')} | errors={row.get('error_count', 0)} "
+            f"warnings={row.get('warning_count', 0)}"
         )
         if row.get('error'):
             print(f"    ERROR DETAILS: {row.get('error')}")
