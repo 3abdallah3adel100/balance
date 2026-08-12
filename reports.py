@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable
 
 import pandas as pd
@@ -21,6 +22,20 @@ def money(value, currency="EGP") -> str:
     return f"{float(value):,.2f} {currency}"
 
 
+def whole_money(value, currency="EGP") -> str:
+    """Round to the nearest whole number using .5 => up, only for message 2."""
+    if value is None:
+        return "N/A"
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite():
+            return "N/A"
+        rounded = number.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return f"{int(rounded):,} {currency}"
+    except (InvalidOperation, ValueError, TypeError):
+        return "N/A"
+
+
 def pct(value) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return "N/A"
@@ -28,9 +43,15 @@ def pct(value) -> str:
 
 
 def days(value) -> str:
+    """Format coverage as whole days + hours, e.g. 1 day . 12 hours."""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return "N/A"
-    return f"{float(value):,.2f} days"
+
+    total_hours = max(0, int(round(float(value) * 24)))
+    whole_days, hours = divmod(total_hours, 24)
+    day_label = "day" if whole_days == 1 else "days"
+    hour_label = "hour" if hours == 1 else "hours"
+    return f"{whole_days} {day_label} . {hours} {hour_label}"
 
 
 def safe_ratio_pct(a: float, b: float) -> float | None:
@@ -99,13 +120,11 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
         balance = row.get("balance")
 
         if coverage is not None and pd.notna(coverage) and float(coverage) <= CRITICAL_COVERAGE_DAYS:
-            alarm = "🚨 CRITICAL — Recharge needed. Balance covers 24 hours or less."
-        elif coverage is not None and pd.notna(coverage) and float(coverage) < TARGET_COVERAGE_DAYS:
             alarm = "⚠️ Balance is below the 3-day target."
         elif coverage is None or pd.isna(coverage):
             alarm = "⚠️ Balance unavailable — verify balance source."
         else:
-            alarm = "✅ Balance coverage is healthy."
+            alarm = "✅ Balance coverage is above the 1-day alarm threshold."
 
         lines.extend([
             f"*Ad Account ID:* {row.get('account_id', '-')}",
@@ -148,7 +167,7 @@ def build_agent_message_2(snapshot_df: pd.DataFrame, code: str) -> str:
     for _, row in df.iterrows():
         lines.extend([
             f"Acc ID : {row.get('account_id', '-')}",
-            f"Balance : {money(row.get('balance'), row.get('currency', 'EGP'))}",
+            f"Balance : {whole_money(row.get('balance'), row.get('currency', 'EGP'))}",
             "",
         ])
     return "\n".join(lines).strip()
