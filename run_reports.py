@@ -7,12 +7,16 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+import config as app_config
 from config import (
     AGENT_REPORT_RECIPIENTS,
-    AUTOMATION_MAX_WORKERS,
-    AUTOMATION_TIMEZONE,
     OVERALL_REPORT_RECIPIENTS,
 )
+
+# Safe defaults for GitHub Actions / headless execution.
+# These can optionally be overridden in config.py.
+AUTOMATION_TIMEZONE = getattr(app_config, "AUTOMATION_TIMEZONE", "Africa/Cairo")
+AUTOMATION_MAX_WORKERS = int(getattr(app_config, "AUTOMATION_MAX_WORKERS", 8))
 from meta_api import MetaClient, fetch_full_snapshot
 from reports import (
     build_agent_message_1,
