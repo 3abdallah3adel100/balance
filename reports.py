@@ -128,29 +128,30 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
 
 
 def build_agent_message_2(snapshot_df: pd.DataFrame, code: str) -> str:
-    name = MEDIA_BUYER_MAP.get(code, code)
+    """Critical balance message with a fixed Taher Team header.
+
+    Exact requested structure:
+    *Taher Team*
+    Acc ID : ...
+    Balance : ...
+    """
     df = _spending_agent_accounts(snapshot_df, code)
     if not df.empty:
         coverage = pd.to_numeric(df["coverage_days"], errors="coerce")
         df = df[coverage <= CRITICAL_COVERAGE_DAYS].copy()
 
-    lines = [f"🚨 *{name} Team ({code}) — Recharge Required*", ""]
+    lines = ["*Taher Team*", ""]
     if df.empty:
-        lines.append("No critical accounts currently need a recharge alert.")
-        return "\n".join(lines)
+        lines.append("No critical accounts currently need recharge.")
+        return "\n".join(lines).strip()
 
-    total_required = 0.0
     for _, row in df.iterrows():
-        required = float(row.get("required_for_3_days") or 0)
-        total_required += required
         lines.extend([
-            f"*Acc ID:* {row.get('account_id', '-')}",
-            f"*Amount to reach 3-day coverage:* {money(required, row.get('currency', 'EGP'))}",
+            f"Acc ID : {row.get('account_id', '-')}",
+            f"Balance : {money(row.get('balance'), row.get('currency', 'EGP'))}",
             "",
         ])
-    lines.extend(["──────────────", f"*Total Recharge Required:* {money(total_required)}"])
     return "\n".join(lines).strip()
-
 
 def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | None = None) -> str:
     allocation = OVERALL_ALLOCATION_BUDGET if allocation_budget is None else float(allocation_budget)
