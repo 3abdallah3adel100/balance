@@ -39,6 +39,18 @@ def env_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+
+
+def safe_num(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        if pd.isna(number) or not __import__("math").isfinite(number):
+            return default
+        return number
+    except Exception:
+        return default
+
+
 def mask_phone(value: str) -> str:
     digits = "".join(ch for ch in str(value or "") if ch.isdigit())
     if len(digits) <= 4:
@@ -138,10 +150,10 @@ def main() -> int:
     for _, row in snapshot_df.iterrows():
         print(
             f"{row.get('account_id', '-')} | {row.get('account_name', '-')} | "
-            f"spend={float(row.get('spend_today') or 0):,.2f} ({row.get('spend_source', '-')}) | "
-            f"campaign_budget={float(row.get('campaign_daily_budget') or 0):,.2f} | "
-            f"adset_budget={float(row.get('adset_daily_budget') or 0):,.2f} | "
-            f"total_budget={float(row.get('active_daily_budget') or 0):,.2f} | "
+            f"spend={safe_num(row.get('spend_today')):,.2f} ({row.get('spend_source', '-')}) | "
+            f"campaign_budget={safe_num(row.get('campaign_daily_budget')):,.2f} | "
+            f"adset_budget={safe_num(row.get('adset_daily_budget')):,.2f} | "
+            f"total_budget={safe_num(row.get('active_daily_budget')):,.2f} | "
             f"campaign_spend_source={row.get('campaign_spend_source', '-')} rows={row.get('campaign_spend_rows', 0)} | "
             f"adset_spend_source={row.get('adset_spend_source', '-')} rows={row.get('adset_spend_rows', 0)} | "
             f"timezone={row.get('timezone_name', '-') or '-'} | "
@@ -156,6 +168,18 @@ def main() -> int:
             print(f"    ERROR DETAILS: {row.get('error')}")
 
     if _details:
+        budget_details = [item for item in _details if item.get("row_type") == "budget"]
+        if budget_details:
+            print("--- BUDGET ITEMS COUNTED ---")
+            for item in sorted(budget_details, key=lambda x: (str(x.get("account_name", "")), str(x.get("budget_level", "")), str(x.get("campaign_name") or x.get("adset_name") or ""))):
+                item_name = item.get("campaign_name") or item.get("adset_name") or item.get("entity_name") or "-"
+                item_id = item.get("adset_id") or item.get("campaign_id") or item.get("entity_id") or "-"
+                print(
+                    f"BUDGET | account={item.get('account_id', '-')} | {item.get('account_name', '-')} | "
+                    f"level={item.get('budget_level', '-')} | id={item_id} | name={item_name} | "
+                    f"spend_today={safe_num(item.get('spend_today')):,.2f} | daily_budget={safe_num(item.get('daily_budget')):,.2f}"
+                )
+
         error_details = [item for item in _details if item.get("row_type") in {"ERROR", "WARNING"}]
         if error_details:
             print("--- META DETAIL ERRORS / WARNINGS ---")

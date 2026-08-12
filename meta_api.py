@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -30,8 +31,12 @@ class MetaAPIError(RuntimeError):
 
 
 def _money_float(value: Any) -> float:
+    """Convert Meta numeric values safely; NaN/inf are treated as zero."""
     try:
-        return float(value or 0)
+        if value is None or pd.isna(value):
+            return 0.0
+        number = float(value)
+        return number if math.isfinite(number) else 0.0
     except Exception:
         return 0.0
 
@@ -342,13 +347,22 @@ class MetaClient:
 
 
 def api_money_to_major(value: Any, currency: str) -> float | None:
-    if value in (None, ""):
-        return None
+    """Convert Meta minor-unit money to major units without allowing NaN to poison totals."""
     try:
+        if value is None or value == "" or pd.isna(value):
+            return None
         raw = float(value)
     except Exception:
         return None
+    if not math.isfinite(raw):
+        return None
     scale = CURRENCY_MINOR_UNIT_SCALE.get(str(currency or "").upper(), DEFAULT_MINOR_UNIT_SCALE)
+    try:
+        scale = float(scale)
+    except Exception:
+        scale = float(DEFAULT_MINOR_UNIT_SCALE)
+    if not math.isfinite(scale) or scale <= 0:
+        scale = float(DEFAULT_MINOR_UNIT_SCALE)
     return raw / scale
 
 
@@ -594,13 +608,19 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
     campaign_candidate_ids = set()
     if not campaigns.empty:
         for _, row in campaigns.iterrows():
-            if row.get("daily_budget") not in (None, "", 0, "0"):
-                campaign_candidate_ids.add(str(row.get("id") or ""))
+            budget_major = api_money_to_major(row.get("daily_budget"), currency)
+            if budget_major is not None and budget_major > 0:
+                entity_id = str(row.get("id") or "").strip()
+                if entity_id:
+                    campaign_candidate_ids.add(entity_id)
     adset_candidate_ids = set()
     if not adsets.empty:
         for _, row in adsets.iterrows():
-            if row.get("daily_budget") not in (None, "", 0, "0"):
-                adset_candidate_ids.add(str(row.get("id") or ""))
+            budget_major = api_money_to_major(row.get("daily_budget"), currency)
+            if budget_major is not None and budget_major > 0:
+                entity_id = str(row.get("id") or "").strip()
+                if entity_id:
+                    adset_candidate_ids.add(entity_id)
 
     campaign_has_candidate_spend = any(
         _money_float(campaign_spend_by_id.get(entity_id, 0)) > 0
@@ -693,8 +713,14 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         "required_for_3_days": required_for_3_days,
         "active_campaigns_checked": int(len(campaigns)),
         "active_adsets_checked": int(len(adsets)),
-        "campaigns_with_spend": int(sum(1 for v in campaign_spend_by_id.values() if v > 0)),
-        "adsets_with_spend": int(sum(1 for v in adset_spend_by_id.values() if v > 0)),
+        "campaigns_with_spend": int(sum(
+            1 for entity_id in set(campaigns.get("id", pd.Series(dtype=str)).astype(str))
+            if _money_float(campaign_spend_by_id.get(entity_id, 0.0)) > 0
+        )),
+        "adsets_with_spend": int(sum(
+            1 for entity_id in set(adsets.get("id", pd.Series(dtype=str)).astype(str))
+            if _money_float(adset_spend_by_id.get(entity_id, 0.0)) > 0
+        )),
         "active_budget_items": len(budget_details),
         "campaign_fetch_status": campaign_fetch_status,
         "adset_fetch_status": adset_fetch_status,
