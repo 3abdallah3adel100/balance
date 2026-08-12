@@ -38,7 +38,7 @@ OVERALL_REPORT_RECIPIENTS = [
 # >>> EDIT THIS VALUE MANUALLY WHEN YOUR OVERALL ALLOCATION CHANGES <<<
 # This value is used ONLY in the Overall Management Report.
 # It does NOT affect any agent balance/recharge calculation.
-OVERALL_ALLOCATION_BUDGET = 0.0  # EGP per day, example: 250000.0
+OVERALL_ALLOCATION_BUDGET = 80000.0  # EGP per day, example: 250000.0
 
 # Balance alert/recharge rules for personal agent reports.
 CRITICAL_COVERAGE_DAYS = 1.0
