@@ -95,7 +95,8 @@ if refresh:
             if accounts.empty:
                 status.update(label="No ad accounts found", state="error")
                 st.stop()
-            snapshot_df, details = fetch_full_snapshot(client, accounts, max_workers=max_workers)
+            cairo_today = datetime.now(ZoneInfo("Africa/Cairo")).date()
+            snapshot_df, details = fetch_full_snapshot(client, accounts, max_workers=max_workers, spend_date=cairo_today)
             st.session_state["snapshot_df"] = snapshot_df
             st.session_state["budget_details"] = details
             st.session_state["last_refresh"] = datetime.now(ZoneInfo("Africa/Cairo"))
@@ -134,15 +135,18 @@ if not snapshot_df.empty:
     st.subheader("Ad Accounts")
     cols = [
         "buyer_code", "media_buyer", "account_id", "account_name", "currency",
-        "spend_today", "active_daily_budget", "balance", "coverage_days",
-        "required_for_3_days", "balance_source", "active_budget_items", "status", "error"
+        "spend_today", "spend_source", "campaign_daily_budget", "adset_daily_budget",
+        "active_daily_budget", "balance", "coverage_days", "required_for_3_days",
+        "active_campaigns_checked", "campaigns_with_spend", "active_adsets_checked",
+        "adsets_with_spend", "balance_source", "active_budget_items", "fetch_status",
+        "error_count", "status", "error"
     ]
     st.dataframe(display[[c for c in cols if c in display.columns]], use_container_width=True, hide_index=True)
 
-    with st.expander("Spending Budget Details (CBO / ABO)"):
+    with st.expander("Budget Details + Meta Fetch Diagnostics (CBO / ABO / Errors)", expanded=True):
         details = pd.DataFrame(st.session_state["budget_details"])
         if details.empty:
-            st.info("No spending daily-budget items found.")
+            st.info("No budget/error detail rows found.")
         else:
             st.dataframe(details, use_container_width=True, hide_index=True)
 
@@ -212,8 +216,9 @@ if send:
 
 st.divider()
 st.caption(
-    "Budget rule: only campaigns with Spend Today > 0 are counted, regardless of current status. "
-    "For CBO, campaign daily_budget is counted once. For ABO, only ad sets that spent today are summed."
+    "Budget rule: a Campaign or Ad Set is counted only when effective_status = ACTIVE, "
+    "daily_budget > 0, and that exact Campaign/Ad Set has Spend Today > 0. "
+    "Campaign and Ad Set budgets are checked independently, matching the working Google Sheets logic."
 )
 st.caption(
     "Balance note: Meta documents the Ad Account 'balance' field as bill amount due. "

@@ -129,6 +129,39 @@ def main() -> int:
 
     print_snapshot_summary(snapshot_df, spend_date.isoformat())
 
+    if getattr(client, "discovery_errors", None):
+        print("WARNING: ad-account discovery had source errors:")
+        for item in client.discovery_errors:
+            print(f"  - {item}")
+
+    print("--- ACCOUNT FETCH DIAGNOSTICS ---")
+    for _, row in snapshot_df.iterrows():
+        print(
+            f"{row.get('account_id', '-')} | {row.get('account_name', '-')} | "
+            f"spend={float(row.get('spend_today') or 0):,.2f} ({row.get('spend_source', '-')}) | "
+            f"campaign_budget={float(row.get('campaign_daily_budget') or 0):,.2f} | "
+            f"adset_budget={float(row.get('adset_daily_budget') or 0):,.2f} | "
+            f"total_budget={float(row.get('active_daily_budget') or 0):,.2f} | "
+            f"active_campaigns={row.get('active_campaigns_checked', 0)} "
+            f"campaigns_spent={row.get('campaigns_with_spend', 0)} | "
+            f"active_adsets={row.get('active_adsets_checked', 0)} "
+            f"adsets_spent={row.get('adsets_with_spend', 0)} | "
+            f"fetch_status={row.get('fetch_status', '-')} | errors={row.get('error_count', 0)}"
+        )
+        if row.get('error'):
+            print(f"    ERROR DETAILS: {row.get('error')}")
+
+    if _details:
+        error_details = [item for item in _details if item.get("row_type") in {"ERROR", "WARNING"}]
+        if error_details:
+            print("--- META DETAIL ERRORS / WARNINGS ---")
+            for item in error_details:
+                print(
+                    f"{item.get('row_type')} | account={item.get('account_id', '-')} | "
+                    f"type={item.get('entity_type', '-')} | entity={item.get('entity_id', '-')} | "
+                    f"name={item.get('entity_name', '-')} | {item.get('error', '-')}"
+                )
+
     account_errors = snapshot_df[
         snapshot_df.get("error", pd.Series(index=snapshot_df.index, dtype=object)).notna()
     ]

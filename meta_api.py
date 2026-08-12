@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
@@ -27,11 +29,19 @@ class MetaAPIError(RuntimeError):
     pass
 
 
+def _money_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+
 @dataclass
 class MetaClient:
     access_token: str
     api_version: str = "v26.0"
     timeout: int = 60
+    discovery_errors: list[str] = field(default_factory=list)
 
     def _get(self, path_or_url: str, params: dict[str, Any] | None = None) -> dict:
         url = path_or_url if path_or_url.startswith("http") else f"{BASE_URL}/{self.api_version}/{path_or_url.lstrip('/')}"
@@ -43,8 +53,17 @@ class MetaClient:
         except Exception:
             payload = {}
         if not response.ok:
-            message = payload.get("error", {}).get("message") or response.text
-            raise MetaAPIError(f"Meta API {response.status_code}: {message[:1000]}")
+            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            message = error.get("message") or response.text or "Unknown Meta API error"
+            code = error.get("code")
+            subcode = error.get("error_subcode")
+            extra = []
+            if code is not None:
+                extra.append(f"code={code}")
+            if subcode is not None:
+                extra.append(f"subcode={subcode}")
+            suffix = f" ({', '.join(extra)})" if extra else ""
+            raise MetaAPIError(f"Meta API {response.status_code}{suffix}: {message[:1200]}")
         return payload
 
     def fetch_all_pages(self, path_or_url: str, params: dict[str, Any] | None = None) -> list[dict]:
@@ -64,6 +83,7 @@ class MetaClient:
     def get_ad_accounts(self) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         sources: list[tuple[str, str, bool]] = []
+        self.discovery_errors = []
 
         if INCLUDE_ME_AD_ACCOUNTS:
             sources.append(("me/adaccounts", "me/adaccounts", True))
@@ -78,7 +98,8 @@ class MetaClient:
         for source_name, endpoint, is_me in sources:
             try:
                 rows = self.fetch_all_pages(endpoint, {"fields": fields, "limit": 500})
-            except Exception:
+            except Exception as exc:
+                self.discovery_errors.append(f"{source_name}: {exc}")
                 continue
             if not rows:
                 continue
@@ -98,93 +119,164 @@ class MetaClient:
         out = pd.concat(frames, ignore_index=True)
         if "id" not in out.columns:
             return pd.DataFrame()
-        out = out.sort_values(["name", "source"], na_position="last").drop_duplicates("id", keep="first")
+        sort_cols = [c for c in ["name", "source"] if c in out.columns]
+        if sort_cols:
+            out = out.sort_values(sort_cols, na_position="last")
+        out = out.drop_duplicates("id", keep="first")
         out["clean_account_id"] = out["id"].map(clean_account_id)
         out["buyer_code"] = out["name"].map(extract_buyer_code)
         out["media_buyer"] = out["buyer_code"].map(buyer_name)
         return out.reset_index(drop=True)
 
-    def get_campaigns(self, account_id: str) -> pd.DataFrame:
+    def _get_active_budget_entities(self, account_id: str, entity_type: str) -> tuple[pd.DataFrame, list[str]]:
+        """Fetch ACTIVE campaigns/adsets with a fallback if Meta rejects effective_status as a query param.
+
+        This mirrors the working Google Sheets approach:
+        /campaigns?...&effective_status=['ACTIVE']
+        /adsets?...&effective_status=['ACTIVE']
+
+        We ALSO filter locally by effective_status == ACTIVE so a paused entity can never count.
+        """
+        if entity_type not in {"campaigns", "adsets"}:
+            raise ValueError("entity_type must be campaigns or adsets")
+
         clean_id = clean_account_id(account_id)
-        fields = "id,name,status,effective_status,daily_budget,lifetime_budget,budget_remaining"
-        rows = self.fetch_all_pages(
-            f"act_{clean_id}/campaigns",
-            {"fields": fields, "limit": 1000},
-        )
+        if entity_type == "campaigns":
+            fields = "id,name,status,effective_status,daily_budget,lifetime_budget,budget_remaining"
+            limit = 1000
+        else:
+            fields = "id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,start_time,end_time"
+            limit = 2000
+
+        warnings: list[str] = []
+        params = {
+            "fields": fields,
+            # Same intent as the user's working Apps Script.
+            "effective_status": json.dumps(["ACTIVE"]),
+            "limit": limit,
+        }
+        try:
+            rows = self.fetch_all_pages(f"act_{clean_id}/{entity_type}", params)
+        except Exception as filtered_exc:
+            warnings.append(
+                f"{entity_type} ACTIVE-filter request failed, retried without server filter: {filtered_exc}"
+            )
+            rows = self.fetch_all_pages(
+                f"act_{clean_id}/{entity_type}",
+                {"fields": fields, "limit": limit},
+            )
+
         df = pd.DataFrame(rows)
-        if not df.empty:
-            df["account_id"] = clean_id
+        if df.empty:
+            return df, warnings
+        if "effective_status" not in df.columns:
+            df["effective_status"] = ""
+        df["effective_status"] = df["effective_status"].astype(str).str.upper().str.strip()
+        df = df[df["effective_status"] == "ACTIVE"].copy()
+        if "id" in df.columns:
+            df["id"] = df["id"].astype(str)
+        if "campaign_id" in df.columns:
+            df["campaign_id"] = df["campaign_id"].astype(str)
+        df["account_id"] = clean_id
+        return df.reset_index(drop=True), warnings
+
+    def get_campaigns(self, account_id: str) -> pd.DataFrame:
+        df, _warnings = self._get_active_budget_entities(account_id, "campaigns")
         return df
 
     def get_adsets(self, account_id: str) -> pd.DataFrame:
-        clean_id = clean_account_id(account_id)
-        fields = "id,name,campaign_id,status,effective_status,daily_budget,lifetime_budget,start_time,end_time"
-        rows = self.fetch_all_pages(
-            f"act_{clean_id}/adsets",
-            {"fields": fields, "limit": 2000},
-        )
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df["account_id"] = clean_id
+        df, _warnings = self._get_active_budget_entities(account_id, "adsets")
         return df
 
-    def get_today_spend(self, account_id: str, today: date | None = None) -> float:
-        clean_id = clean_account_id(account_id)
+    def get_active_campaigns(self, account_id: str) -> tuple[pd.DataFrame, list[str]]:
+        return self._get_active_budget_entities(account_id, "campaigns")
+
+    def get_active_adsets(self, account_id: str) -> tuple[pd.DataFrame, list[str]]:
+        return self._get_active_budget_entities(account_id, "adsets")
+
+    def get_entity_today_spend(self, entity_id: str, today: date | None = None) -> float:
+        """Exact equivalent of fetchTodaySpend(id) from the user's working Apps Script."""
         day = today or date.today()
         rows = self.fetch_all_pages(
-            f"act_{clean_id}/insights",
+            f"{entity_id}/insights",
             {
                 "fields": "spend",
-                "level": "account",
                 "time_range": f'{{"since":"{day.isoformat()}","until":"{day.isoformat()}"}}',
                 "limit": 50,
             },
         )
         if not rows:
             return 0.0
-        return float(pd.to_numeric(pd.Series([r.get("spend", 0) for r in rows]), errors="coerce").fillna(0).sum())
+        return float(
+            pd.to_numeric(
+                pd.Series([row.get("spend", 0) for row in rows]),
+                errors="coerce",
+            ).fillna(0).sum()
+        )
 
-    def get_today_spend_breakdown(
+    def get_today_spend_with_diagnostics(
         self,
         account_id: str,
-        level: str,
         today: date | None = None,
-    ) -> pd.DataFrame:
-        """Return entities that actually spent today.
+    ) -> tuple[float, str, str | None]:
+        """Fetch account spend like the working Apps Script, with a campaign-level fallback.
 
-        Status is joined/checked separately from Campaign/Ad Set objects.
-        Only entities with effective_status == ACTIVE are eligible for budget counting.
+        Primary query intentionally DOES NOT send level=account, matching:
+        act_<id>/insights?fields=spend&time_range[...]
         """
-        if level not in {"campaign", "adset"}:
-            raise ValueError("level must be 'campaign' or 'adset'")
-
         clean_id = clean_account_id(account_id)
         day = today or date.today()
-        fields = "spend,campaign_id,campaign_name"
-        if level == "adset":
-            fields += ",adset_id,adset_name"
+        time_range = f'{{"since":"{day.isoformat()}","until":"{day.isoformat()}"}}'
+        primary_error: str | None = None
 
-        rows = self.fetch_all_pages(
-            f"act_{clean_id}/insights",
-            {
-                "fields": fields,
-                "level": level,
-                "time_range": f'{{"since":"{day.isoformat()}","until":"{day.isoformat()}"}}',
-                "limit": 2000,
-            },
-        )
-        if not rows:
-            return pd.DataFrame()
+        try:
+            rows = self.fetch_all_pages(
+                f"act_{clean_id}/insights",
+                {"fields": "spend", "time_range": time_range, "limit": 50},
+            )
+            spend = float(
+                pd.to_numeric(
+                    pd.Series([row.get("spend", 0) for row in rows]),
+                    errors="coerce",
+                ).fillna(0).sum()
+            ) if rows else 0.0
+            if spend > 0:
+                return spend, "account_insights", None
+        except Exception as exc:
+            primary_error = str(exc)
 
-        df = pd.DataFrame(rows)
-        if "spend" not in df.columns:
-            return pd.DataFrame()
-        df["spend"] = pd.to_numeric(df["spend"], errors="coerce").fillna(0.0)
-        df = df[df["spend"] > 0].copy()
-        for col in ["campaign_id", "adset_id"]:
-            if col in df.columns:
-                df[col] = df[col].astype(str)
-        return df.reset_index(drop=True)
+        # Diagnostic/fallback: campaign-level spend is non-overlapping when summed.
+        try:
+            campaign_rows = self.fetch_all_pages(
+                f"act_{clean_id}/insights",
+                {
+                    "fields": "spend,campaign_id,campaign_name",
+                    "level": "campaign",
+                    "time_range": time_range,
+                    "limit": 2000,
+                },
+            )
+            campaign_spend = float(
+                pd.to_numeric(
+                    pd.Series([row.get("spend", 0) for row in campaign_rows]),
+                    errors="coerce",
+                ).fillna(0).sum()
+            ) if campaign_rows else 0.0
+            if campaign_spend > 0:
+                msg = None
+                if primary_error:
+                    msg = f"Account-level spend failed; campaign-level fallback succeeded. Primary error: {primary_error}"
+                return campaign_spend, "campaign_level_fallback", msg
+            return 0.0, "no_spend_returned", primary_error
+        except Exception as fallback_exc:
+            combined = f"Account spend failed/empty. Primary: {primary_error or 'no spend rows'} | Fallback: {fallback_exc}"
+            return 0.0, "spend_error", combined
+
+    def get_today_spend(self, account_id: str, today: date | None = None) -> float:
+        spend, _source, error = self.get_today_spend_with_diagnostics(account_id, today)
+        if error and _source == "spend_error":
+            raise MetaAPIError(error)
+        return spend
 
 
 def api_money_to_major(value: Any, currency: str) -> float | None:
@@ -199,12 +291,6 @@ def api_money_to_major(value: Any, currency: str) -> float | None:
 
 
 def _parse_display_string_money(display_string: Any, currency: str) -> float | None:
-    """Only parse display_string if it clearly contains the account currency or a money symbol.
-
-    This intentionally avoids treating masked card digits as a balance.
-    """
-    import re
-
     text = str(display_string or "").strip()
     if not text:
         return None
@@ -224,16 +310,6 @@ def _parse_display_string_money(display_string: Any, currency: str) -> float | N
 
 
 def get_available_balance(account_row: pd.Series) -> tuple[float | None, str]:
-    """Resolve the balance used for coverage calculations.
-
-    Priority:
-    1) manual override (explicit usable balance)
-    2) clearly monetary funding_source_details.display_string
-    3) Meta Ad Account `balance` field fallback
-
-    Meta documents `balance` as bill amount due. Therefore prepaid/available-funds
-    accounts may require an override if the API value does not match Ads Manager.
-    """
     clean_id = clean_account_id(account_row.get("id") or account_row.get("account_id"))
     override = MANUAL_BALANCE_OVERRIDES.get(clean_id)
     if override is None:
@@ -254,234 +330,246 @@ def get_available_balance(account_row: pd.Series) -> tuple[float | None, str]:
     return None, "unavailable"
 
 
+def _entity_spend_map(
+    client: MetaClient,
+    entities: pd.DataFrame,
+    today: date | None = None,
+    max_workers: int = 12,
+    entity_label: str = "entity",
+) -> tuple[dict[str, float], list[dict]]:
+    """Run fetchTodaySpend(id) for every ACTIVE entity with a daily_budget.
+
+    Unlike the previous version, errors are NOT silently hidden. They are returned
+    as diagnostics and later shown in Streamlit + GitHub Actions logs.
+    """
+    if entities.empty or "id" not in entities.columns:
+        return {}, []
+
+    candidates: list[tuple[str, str]] = []
+    for _, row in entities.iterrows():
+        entity_id = str(row.get("id") or "").strip()
+        if not entity_id:
+            continue
+        effective_status = str(row.get("effective_status") or "").strip().upper()
+        if effective_status != "ACTIVE":
+            continue
+        daily_budget = row.get("daily_budget")
+        if daily_budget in (None, "", 0, "0"):
+            continue
+        candidates.append((entity_id, str(row.get("name") or entity_id)))
+
+    if not candidates:
+        return {}, []
+
+    spend_map: dict[str, float] = {}
+    errors: list[dict] = []
+
+    def fetch_one(entity_id: str, entity_name: str) -> tuple[str, float, str | None, str]:
+        try:
+            spend = client.get_entity_today_spend(entity_id, today=today)
+            return entity_id, spend, None, entity_name
+        except Exception as exc:
+            return entity_id, 0.0, str(exc), entity_name
+
+    workers = max(1, min(max_workers, len(candidates)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(fetch_one, entity_id, entity_name): (entity_id, entity_name)
+            for entity_id, entity_name in candidates
+        }
+        for future in as_completed(futures):
+            entity_id, entity_name = futures[future]
+            fetched_id, spend, error, fetched_name = future.result()
+            spend_map[fetched_id] = float(spend or 0.0)
+            if error:
+                errors.append({
+                    "entity_type": entity_label,
+                    "entity_id": fetched_id,
+                    "entity_name": fetched_name or entity_name,
+                    "error": error,
+                })
+
+    return spend_map, errors
+
+
 def calculate_account_daily_budget(
     campaigns: pd.DataFrame,
     adsets: pd.DataFrame,
     campaign_spend_by_id: dict[str, float],
     adset_spend_by_id: dict[str, float],
     currency: str,
-) -> tuple[float, list[dict], list[str]]:
-    """Calculate the current executable daily budget.
+) -> tuple[float, float, float, list[dict]]:
+    """Mirror the Apps Script: campaign budgets and ad-set budgets are independent.
 
-    Campaigns and Ad Sets are evaluated independently, but an entity counts ONLY when:
-    - effective_status == ACTIVE right now
-    - daily_budget > 0
-    - Spend Today > 0
-
-    So a Campaign/Ad Set that spent earlier today but is now paused is excluded.
+    A budget counts only when ALL are true:
+      - effective_status == ACTIVE
+      - daily_budget exists and > 0
+      - that Campaign/Ad Set itself has Spend Today > 0
     """
-    total = 0.0
+    campaign_total = 0.0
+    adset_total = 0.0
     details: list[dict] = []
-    warnings: list[str] = []
 
-    # 1) Campaign-level daily budgets that actually spent today.
     if not campaigns.empty:
-        campaigns = campaigns.copy()
-        campaigns["id"] = campaigns.get("id", pd.Series(dtype=str)).astype(str)
         for _, campaign in campaigns.iterrows():
             campaign_id = str(campaign.get("id") or "")
-            effective_status = str(campaign.get("effective_status") or "").strip().upper()
+            status = str(campaign.get("effective_status") or "").strip().upper()
             daily_budget = api_money_to_major(campaign.get("daily_budget"), currency) or 0.0
-            spend_today = float(campaign_spend_by_id.get(campaign_id, 0.0) or 0.0)
-            if effective_status != "ACTIVE" or daily_budget <= 0 or spend_today <= 0:
+            spend_today = _money_float(campaign_spend_by_id.get(campaign_id, 0.0))
+            if status != "ACTIVE" or daily_budget <= 0 or spend_today <= 0:
                 continue
-            total += daily_budget
+            campaign_total += daily_budget
             details.append({
+                "budget_level": "Campaign",
                 "campaign_id": campaign_id,
                 "campaign_name": str(campaign.get("name") or campaign_id),
-                "campaign_status": str(campaign.get("effective_status") or ""),
+                "effective_status": status,
                 "spend_today": spend_today,
-                "budget_level": "Campaign",
                 "daily_budget": daily_budget,
             })
 
-    # 2) Ad Set-level daily budgets that actually spent today.
-    #    Do NOT gate this on whether the parent campaign has a campaign budget.
     if not adsets.empty:
-        adsets = adsets.copy()
-        adsets["id"] = adsets.get("id", pd.Series(dtype=str)).astype(str)
-        adsets["campaign_id"] = adsets.get("campaign_id", pd.Series(dtype=str)).astype(str)
         for _, adset in adsets.iterrows():
             adset_id = str(adset.get("id") or "")
-            effective_status = str(adset.get("effective_status") or "").strip().upper()
+            status = str(adset.get("effective_status") or "").strip().upper()
             daily_budget = api_money_to_major(adset.get("daily_budget"), currency) or 0.0
-            spend_today = float(adset_spend_by_id.get(adset_id, 0.0) or 0.0)
-            if effective_status != "ACTIVE" or daily_budget <= 0 or spend_today <= 0:
+            spend_today = _money_float(adset_spend_by_id.get(adset_id, 0.0))
+            if status != "ACTIVE" or daily_budget <= 0 or spend_today <= 0:
                 continue
-            total += daily_budget
+            adset_total += daily_budget
             details.append({
-                "campaign_id": str(adset.get("campaign_id") or ""),
-                "campaign_name": "",
-                "campaign_status": "",
-                "spend_today": spend_today,
                 "budget_level": "Ad Set",
+                "campaign_id": str(adset.get("campaign_id") or ""),
                 "adset_id": adset_id,
                 "adset_name": str(adset.get("name") or adset_id),
-                "adset_status": str(adset.get("effective_status") or ""),
-                "adset_spend_today": spend_today,
+                "effective_status": status,
+                "spend_today": spend_today,
                 "daily_budget": daily_budget,
             })
 
-    return total, details, warnings
+    return campaign_total + adset_total, campaign_total, adset_total, details
 
-
-def _entity_spend_map(
-    client: MetaClient,
-    entities: pd.DataFrame,
-    today: date | None = None,
-    max_workers: int = 12,
-) -> dict[str, float]:
-    """Fetch today's spend for ACTIVE Campaigns / Ad Sets that have a daily budget.
-
-    We skip paused/non-active entities before calling insights. This both matches the
-    report rule and avoids unnecessary API calls/errors for stopped entities.
-    """
-    if entities.empty or "id" not in entities.columns:
-        return {}
-
-    candidates: list[str] = []
-    for _, row in entities.iterrows():
-        entity_id = str(row.get("id") or "").strip()
-        if not entity_id:
-            continue
-        # The entity must be ACTIVE now and have a daily budget before spend matters.
-        effective_status = str(row.get("effective_status") or "").strip().upper()
-        if effective_status != "ACTIVE":
-            continue
-        if row.get("daily_budget") in (None, "", 0, "0"):
-            continue
-        candidates.append(entity_id)
-
-    if not candidates:
-        return {}
-
-    result: dict[str, float] = {}
-
-    def fetch_one(entity_id: str) -> tuple[str, float]:
-        rows = client.fetch_all_pages(
-            f"{entity_id}/insights",
-            {
-                "fields": "spend",
-                "time_range": (
-                    f'{{"since":"{(today or date.today()).isoformat()}",'
-                    f'"until":"{(today or date.today()).isoformat()}"}}'
-                ),
-                "limit": 50,
-            },
-        )
-        if not rows:
-            return entity_id, 0.0
-        spend = pd.to_numeric(
-            pd.Series([r.get("spend", 0) for r in rows]), errors="coerce"
-        ).fillna(0).sum()
-        return entity_id, float(spend)
-
-    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(candidates)))) as executor:
-        futures = {executor.submit(fetch_one, entity_id): entity_id for entity_id in candidates}
-        for future in as_completed(futures):
-            entity_id = futures[future]
-            try:
-                fetched_id, spend = future.result()
-                result[fetched_id] = spend
-            except Exception:
-                # Same behavior as the old sheet script: a failed entity spend lookup
-                # is treated as zero so it cannot add a false budget.
-                result[entity_id] = 0.0
-
-    return result
 
 def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_date: date | None = None) -> dict:
     account_id = clean_account_id(account_row.get("id"))
     account_name = str(account_row.get("name") or account_id)
     currency = str(account_row.get("currency") or "EGP").upper()
     buyer_code = extract_buyer_code(account_name)
+    balance, balance_source = get_available_balance(account_row)
+
+    diagnostic_errors: list[dict] = []
+    warnings: list[str] = []
+
+    # IMPORTANT: no account-spend gate here.
+    # This intentionally mirrors the working Google Sheets script: budgets are
+    # fetched and checked independently even if the account-level spend call is empty.
+    try:
+        campaigns, campaign_fetch_warnings = client.get_active_campaigns(account_id)
+        warnings.extend(campaign_fetch_warnings)
+        campaign_fetch_status = "OK"
+    except Exception as exc:
+        campaigns = pd.DataFrame()
+        campaign_fetch_status = "ERROR"
+        diagnostic_errors.append({
+            "entity_type": "campaign_fetch",
+            "entity_id": account_id,
+            "entity_name": account_name,
+            "error": str(exc),
+        })
 
     try:
-        # Spend-first gate: if the account did not spend today, do NOT fetch
-        # campaigns/ad sets for budget calculations. This removes no-fund / idle
-        # active campaigns from the daily-budget report entirely.
-        spend_today = client.get_today_spend(account_id, today=spend_date)
-        balance, balance_source = get_available_balance(account_row)
-
-        if spend_today <= 0:
-            return {
-                "account_id": account_id,
-                "account_name": account_name,
-                "currency": currency,
-                "buyer_code": buyer_code,
-                "media_buyer": buyer_name(buyer_code),
-                "spend_today": 0.0,
-                "active_daily_budget": 0.0,  # legacy column name; means spending daily budget
-                "balance": balance,
-                "balance_source": balance_source,
-                "coverage_days": None,
-                "required_for_3_days": None,
-                "active_budget_items": 0,
-                "budget_details": [],
-                "warnings": [],
-                "error": None,
-            }
-
-        # Fetch BOTH levels every time the account has spend. This mirrors the
-        # working Google Sheets script and prevents Ad Set budgets from being skipped.
-        campaigns = client.get_campaigns(account_id)
-        adsets = client.get_adsets(account_id)
-
-        # Campaign and Ad Set budgets are evaluated independently, but only entities
-        # that are ACTIVE now are queried for today's spend.
-        campaign_spend_by_id = _entity_spend_map(client, campaigns, today=spend_date)
-        adset_spend_by_id = _entity_spend_map(client, adsets, today=spend_date)
-
-        daily_budget, budget_details, warnings = calculate_account_daily_budget(
-            campaigns,
-            adsets,
-            campaign_spend_by_id,
-            adset_spend_by_id,
-            currency,
-        )
-
-        coverage_days = None
-        if balance is not None and daily_budget > 0:
-            coverage_days = balance / daily_budget
-        required_for_3_days = None
-        if balance is not None and daily_budget > 0:
-            required_for_3_days = max(0.0, daily_budget * 3.0 - balance)
-
-        return {
-            "account_id": account_id,
-            "account_name": account_name,
-            "currency": currency,
-            "buyer_code": buyer_code,
-            "media_buyer": buyer_name(buyer_code),
-            "spend_today": spend_today,
-            "active_daily_budget": daily_budget,  # legacy column name; means spending daily budget
-            "balance": balance,
-            "balance_source": balance_source,
-            "coverage_days": coverage_days,
-            "required_for_3_days": required_for_3_days,
-            "active_budget_items": len(budget_details),
-            "budget_details": budget_details,
-            "warnings": warnings,
-            "error": None,
-        }
+        adsets, adset_fetch_warnings = client.get_active_adsets(account_id)
+        warnings.extend(adset_fetch_warnings)
+        adset_fetch_status = "OK"
     except Exception as exc:
-        return {
-            "account_id": account_id,
-            "account_name": account_name,
-            "currency": currency,
-            "buyer_code": buyer_code,
-            "media_buyer": buyer_name(buyer_code),
-            "spend_today": 0.0,
-            "active_daily_budget": 0.0,
-            "balance": None,
-            "balance_source": "unavailable",
-            "coverage_days": None,
-            "required_for_3_days": None,
-            "active_budget_items": 0,
-            "budget_details": [],
-            "warnings": [],
+        adsets = pd.DataFrame()
+        adset_fetch_status = "ERROR"
+        diagnostic_errors.append({
+            "entity_type": "adset_fetch",
+            "entity_id": account_id,
+            "entity_name": account_name,
             "error": str(exc),
-        }
+        })
+
+    campaign_spend_by_id, campaign_spend_errors = _entity_spend_map(
+        client,
+        campaigns,
+        today=spend_date,
+        entity_label="campaign_spend",
+    )
+    adset_spend_by_id, adset_spend_errors = _entity_spend_map(
+        client,
+        adsets,
+        today=spend_date,
+        entity_label="adset_spend",
+    )
+    diagnostic_errors.extend(campaign_spend_errors)
+    diagnostic_errors.extend(adset_spend_errors)
+
+    daily_budget, campaign_daily_budget, adset_daily_budget, budget_details = calculate_account_daily_budget(
+        campaigns,
+        adsets,
+        campaign_spend_by_id,
+        adset_spend_by_id,
+        currency,
+    )
+
+    spend_today, spend_source, spend_error = client.get_today_spend_with_diagnostics(
+        account_id,
+        today=spend_date,
+    )
+    if spend_error:
+        diagnostic_errors.append({
+            "entity_type": "account_spend",
+            "entity_id": account_id,
+            "entity_name": account_name,
+            "error": spend_error,
+        })
+
+    coverage_days = balance / daily_budget if balance is not None and daily_budget > 0 else None
+    required_for_3_days = max(0.0, daily_budget * 3.0 - balance) if balance is not None and daily_budget > 0 else None
+
+    if diagnostic_errors:
+        fetch_status = "ERROR" if campaign_fetch_status == "ERROR" and adset_fetch_status == "ERROR" else "WARNING"
+        error_text = " | ".join(
+            f"{item['entity_type']}:{item.get('entity_id', '-')}: {item.get('error', '')}"
+            for item in diagnostic_errors[:8]
+        )
+        if len(diagnostic_errors) > 8:
+            error_text += f" | +{len(diagnostic_errors) - 8} more error(s)"
+    else:
+        fetch_status = "OK"
+        error_text = None
+
+    return {
+        "account_id": account_id,
+        "account_name": account_name,
+        "currency": currency,
+        "buyer_code": buyer_code,
+        "media_buyer": buyer_name(buyer_code),
+        "spend_today": spend_today,
+        "spend_source": spend_source,
+        "campaign_daily_budget": campaign_daily_budget,
+        "adset_daily_budget": adset_daily_budget,
+        "active_daily_budget": daily_budget,  # kept for report compatibility
+        "balance": balance,
+        "balance_source": balance_source,
+        "coverage_days": coverage_days,
+        "required_for_3_days": required_for_3_days,
+        "active_campaigns_checked": int(len(campaigns)),
+        "active_adsets_checked": int(len(adsets)),
+        "campaigns_with_spend": int(sum(1 for v in campaign_spend_by_id.values() if v > 0)),
+        "adsets_with_spend": int(sum(1 for v in adset_spend_by_id.values() if v > 0)),
+        "active_budget_items": len(budget_details),
+        "campaign_fetch_status": campaign_fetch_status,
+        "adset_fetch_status": adset_fetch_status,
+        "fetch_status": fetch_status,
+        "error_count": len(diagnostic_errors),
+        "error": error_text,
+        "budget_details": budget_details,
+        "warnings": warnings,
+        "diagnostic_errors": diagnostic_errors,
+    }
 
 
 def fetch_full_snapshot(
@@ -492,6 +580,7 @@ def fetch_full_snapshot(
 ) -> tuple[pd.DataFrame, list[dict]]:
     if accounts_df.empty:
         return pd.DataFrame(), []
+
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 16))) as executor:
         futures = [
@@ -499,21 +588,80 @@ def fetch_full_snapshot(
             for _, row in accounts_df.iterrows()
         ]
         for future in as_completed(futures):
-            results.append(future.result())
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                results.append({
+                    "account_id": "UNKNOWN",
+                    "account_name": "UNKNOWN",
+                    "currency": "EGP",
+                    "buyer_code": "UNKNOWN",
+                    "media_buyer": "Unknown",
+                    "spend_today": 0.0,
+                    "spend_source": "snapshot_error",
+                    "campaign_daily_budget": 0.0,
+                    "adset_daily_budget": 0.0,
+                    "active_daily_budget": 0.0,
+                    "balance": None,
+                    "balance_source": "unavailable",
+                    "coverage_days": None,
+                    "required_for_3_days": None,
+                    "active_campaigns_checked": 0,
+                    "active_adsets_checked": 0,
+                    "campaigns_with_spend": 0,
+                    "adsets_with_spend": 0,
+                    "active_budget_items": 0,
+                    "campaign_fetch_status": "ERROR",
+                    "adset_fetch_status": "ERROR",
+                    "fetch_status": "ERROR",
+                    "error_count": 1,
+                    "error": str(exc),
+                    "budget_details": [],
+                    "warnings": [],
+                    "diagnostic_errors": [{
+                        "entity_type": "snapshot",
+                        "entity_id": "UNKNOWN",
+                        "entity_name": "UNKNOWN",
+                        "error": str(exc),
+                    }],
+                })
 
     detail_rows: list[dict] = []
     simple_rows: list[dict] = []
     for result in results:
-        simple = {k: v for k, v in result.items() if k not in {"budget_details", "warnings"}}
+        simple = {
+            k: v
+            for k, v in result.items()
+            if k not in {"budget_details", "warnings", "diagnostic_errors"}
+        }
         simple["warning_count"] = len(result.get("warnings") or [])
         simple_rows.append(simple)
+
         for item in result.get("budget_details") or []:
             detail_rows.append({
-                "account_id": result["account_id"],
-                "account_name": result["account_name"],
-                "buyer_code": result["buyer_code"],
+                "row_type": "budget",
+                "account_id": result.get("account_id"),
+                "account_name": result.get("account_name"),
+                "buyer_code": result.get("buyer_code"),
                 **item,
             })
+        for item in result.get("diagnostic_errors") or []:
+            detail_rows.append({
+                "row_type": "ERROR",
+                "account_id": result.get("account_id"),
+                "account_name": result.get("account_name"),
+                "buyer_code": result.get("buyer_code"),
+                **item,
+            })
+        for warning in result.get("warnings") or []:
+            detail_rows.append({
+                "row_type": "WARNING",
+                "account_id": result.get("account_id"),
+                "account_name": result.get("account_name"),
+                "buyer_code": result.get("buyer_code"),
+                "error": warning,
+            })
+
     df = pd.DataFrame(simple_rows)
     if not df.empty:
         df = df.sort_values(["buyer_code", "account_name"]).reset_index(drop=True)
