@@ -23,14 +23,14 @@ def money(value, currency="EGP") -> str:
 
 
 def whole_money(value, currency="EGP") -> str:
-    """Round to the nearest whole number using .5 => up, only for message 2."""
+    """Round message-2 amount to the nearest 100; 50 or more rounds up."""
     if value is None:
         return "N/A"
     try:
         number = Decimal(str(value))
         if not number.is_finite():
             return "N/A"
-        rounded = number.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        rounded = (number / Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * Decimal("100")
         return f"{int(rounded):,} {currency}"
     except (InvalidOperation, ValueError, TypeError):
         return "N/A"
