@@ -147,29 +147,47 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
 
 
 def build_agent_message_2(snapshot_df: pd.DataFrame, code: str) -> str:
-    """Critical balance message with a fixed Taher Team header.
+    """Recharge invoice with a fixed Taher Team header.
 
-    Exact requested structure:
-    *Taher Team*
-    Acc ID : ...
-    Balance : ...
+    Include only accounts whose current balance covers LESS than the
+    configured 3-day target. The Balance line shows the amount that must be
+    added now to bring the account up to exactly TARGET_COVERAGE_DAYS.
+
+    Example:
+    daily budget = 1,000 EGP, current balance = 500 EGP
+    recharge needed = (1,000 * 3) - 500 = 2,500 EGP
     """
     df = _spending_agent_accounts(snapshot_df, code)
-    if not df.empty:
-        coverage = pd.to_numeric(df["coverage_days"], errors="coerce")
-        df = df[coverage <= CRITICAL_COVERAGE_DAYS].copy()
 
     lines = ["*Taher Team*", ""]
-    if df.empty:
-        lines.append("No critical accounts currently need recharge.")
+    recharge_rows: list[tuple[pd.Series, float]] = []
+
+    if not df.empty:
+        for _, row in df.iterrows():
+            daily_budget = pd.to_numeric(pd.Series([row.get("active_daily_budget")]), errors="coerce").iloc[0]
+            balance = pd.to_numeric(pd.Series([row.get("balance")]), errors="coerce").iloc[0]
+
+            if pd.isna(daily_budget) or pd.isna(balance) or float(daily_budget) <= 0:
+                continue
+
+            target_balance = float(daily_budget) * float(TARGET_COVERAGE_DAYS)
+            recharge_needed = max(0.0, target_balance - float(balance))
+
+            # Exactly 3 days or more => no recharge invoice line.
+            if recharge_needed > 0:
+                recharge_rows.append((row, recharge_needed))
+
+    if not recharge_rows:
+        lines.append("No accounts currently need recharge to reach the 3-day target.")
         return "\n".join(lines).strip()
 
-    for _, row in df.iterrows():
+    for row, recharge_needed in recharge_rows:
         lines.extend([
             f"Acc ID : {row.get('account_id', '-')}",
-            f"Balance : {whole_money(row.get('balance'), row.get('currency', 'EGP'))}",
+            f"Balance : {whole_money(recharge_needed, row.get('currency', 'EGP'))}",
             "",
         ])
+
     return "\n".join(lines).strip()
 
 def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | None = None) -> str:
