@@ -147,47 +147,42 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
 
 
 def build_agent_message_2(snapshot_df: pd.DataFrame, code: str) -> str:
-    """Recharge invoice with a fixed Taher Team header.
+    """Taher Team recharge invoice for accounts below 3 days coverage.
 
-    Include only accounts whose current balance covers LESS than the
-    configured 3-day target. The Balance line shows the amount that must be
-    added now to bring the account up to exactly TARGET_COVERAGE_DAYS.
-
-    Example:
-    daily budget = 1,000 EGP, current balance = 500 EGP
-    recharge needed = (1,000 * 3) - 500 = 2,500 EGP
+    Only this message logic is changed:
+    - show the account only when coverage is below TARGET_COVERAGE_DAYS
+    - Balance line = amount needed to reach exactly 3 days
     """
     df = _spending_agent_accounts(snapshot_df, code)
+    if not df.empty:
+        coverage = pd.to_numeric(df["coverage_days"], errors="coerce")
+        df = df[coverage < TARGET_COVERAGE_DAYS].copy()
 
     lines = ["*Taher Team*", ""]
-    recharge_rows: list[tuple[pd.Series, float]] = []
-
-    if not df.empty:
-        for _, row in df.iterrows():
-            daily_budget = pd.to_numeric(pd.Series([row.get("active_daily_budget")]), errors="coerce").iloc[0]
-            balance = pd.to_numeric(pd.Series([row.get("balance")]), errors="coerce").iloc[0]
-
-            if pd.isna(daily_budget) or pd.isna(balance) or float(daily_budget) <= 0:
-                continue
-
-            target_balance = float(daily_budget) * float(TARGET_COVERAGE_DAYS)
-            recharge_needed = max(0.0, target_balance - float(balance))
-
-            # Exactly 3 days or more => no recharge invoice line.
-            if recharge_needed > 0:
-                recharge_rows.append((row, recharge_needed))
-
-    if not recharge_rows:
+    if df.empty:
         lines.append("No accounts currently need recharge to reach the 3-day target.")
         return "\n".join(lines).strip()
 
-    for row, recharge_needed in recharge_rows:
+    for _, row in df.iterrows():
+        daily_budget = pd.to_numeric(pd.Series([row.get("active_daily_budget")]), errors="coerce").iloc[0]
+        current_balance = pd.to_numeric(pd.Series([row.get("balance")]), errors="coerce").iloc[0]
+
+        if pd.isna(daily_budget) or pd.isna(current_balance) or float(daily_budget) <= 0:
+            continue
+
+        recharge_needed = max(
+            0.0,
+            (float(daily_budget) * float(TARGET_COVERAGE_DAYS)) - float(current_balance),
+        )
+
+        if recharge_needed <= 0:
+            continue
+
         lines.extend([
             f"Acc ID : {row.get('account_id', '-')}",
             f"Balance : {whole_money(recharge_needed, row.get('currency', 'EGP'))}",
             "",
         ])
-
     return "\n".join(lines).strip()
 
 def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | None = None) -> str:
