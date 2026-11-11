@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-from config import AGENT_REPORT_RECIPIENTS, OVERALL_REPORT_RECIPIENTS
+from config import AGENT_REPORT_RECIPIENTS, OVERALL_REPORT_RECIPIENTS, extract_buyer_code
 
 # Safe fallbacks so GitHub Actions does not fail if these optional values are
 # missing from config.py. This also lets you keep your current Allocation value.
@@ -118,28 +118,22 @@ def redact_meta_error(exc: Exception, tokens: dict[str, str]) -> str:
     return message[:600]
 
 
-def graph_accounts(token: str, api_version: str, path: str, fields: str) -> list[dict]:
-    """Read every pagination page without printing a URL containing access_token."""
+def graph_accounts(token: str, api_version: str, path: str, fields: str,
+                   client: MetaClient | None = None) -> list[dict]:
+    """Read all pages with the same rate-limit policy as other Meta requests."""
+    graph_client = client or MetaClient(access_token=token, api_version=api_version)
     url = f"https://graph.facebook.com/{api_version}/{path}"
     params = {"access_token": token, "fields": fields, "limit": 500}
     rows: list[dict] = []
     while url:
-        response = requests.get(url, params=params, timeout=60)
-        if not response.ok:
-            try:
-                error = response.json().get("error", {})
-                message = error.get("message", "Meta account discovery error")
-                code = error.get("code", response.status_code)
-            except (ValueError, AttributeError):
-                message, code = "Meta account discovery error", response.status_code
-            raise RuntimeError(f"Meta API code={code}: {message[:300]}")
-        data = response.json()
+        data = graph_client._get(url, params)
         rows.extend(data.get("data", []))
         next_url = data.get("paging", {}).get("next")
         if next_url and not next_url.startswith("https://graph.facebook.com/"):
             raise RuntimeError("Unexpected pagination host returned by Meta")
         url, params = next_url, None
     return rows
+
 
 
 def account_key(row: dict) -> str:
@@ -158,7 +152,7 @@ def suitable_baseline_account(row: dict, business_ids: list[str]) -> bool:
 
 
 def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str],
-                          api_version: str) -> tuple[dict[str, list[tuple[str, dict]]], list[str]]:
+                          api_version: str, include_me_accounts: bool = True) -> tuple[dict[str, list[tuple[str, dict]]], list[str]]:
     """Return one account ID with its available token candidates (never token values)."""
     discovered: dict[str, dict[str, dict]] = {}
     warnings: list[str] = []
@@ -184,17 +178,10 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
             per_token[token_label] = value
 
     for label, client in clients.items():
-        # Keep the old MetaClient's discovery and its special account metadata.
-        try:
-            baseline = client.get_ad_accounts()
-            if not baseline.empty:
-                for row in baseline.to_dict("records"):
-                    if suitable_baseline_account(row, business_ids):
-                        add(row, label, str(row.get("source") or "me/adaccounts"))
-            for issue in getattr(client, "discovery_errors", []) or []:
-                warnings.append(f"{label}: {redact_meta_error(Exception(issue), all_tokens)}")
-        except Exception as exc:
-            warnings.append(f"{label}: built-in discovery failed: {redact_meta_error(exc, all_tokens)}")
+        # Do not call get_ad_accounts() here: it re-queries these same
+        # business edges (plus /me) and doubles discovery work. The explicit
+        # queries below cover the selected businesses and preserve full
+        # account metadata, including balances.
 
         # Explicitly query ALL selected businesses with EACH available token.
         # This ensures a new business is included even if config.py is unchanged.
@@ -205,13 +192,19 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
                 try:
                     try:
                         rows = graph_accounts(client.access_token, api_version,
-                                              f"{business_id}/{edge}", META_ACCOUNT_FIELDS)
-                    except RuntimeError:
+                                              f"{business_id}/{edge}", META_ACCOUNT_FIELDS, client=client)
+                    except RuntimeError as exc:
                         # A restricted optional account field should not hide
-                        # otherwise accessible accounts.
+                        # otherwise accessible accounts. A rate limit must NOT
+                        # trigger another identical request using fewer fields.
+                        detail = str(exc).lower()
+                        if ('code=17' in detail or 'code=4' in detail or
+                                'code=32' in detail or 'code=613' in detail or
+                                'request limit' in detail or 'rate limit' in detail):
+                            raise
                         rows = graph_accounts(client.access_token, api_version,
                                               f"{business_id}/{edge}",
-                                              "id,account_id,name,account_status,currency")
+                                              "id,account_id,name,account_status,currency", client=client)
                     business_edge_success[business_id] += 1
                     for row in rows:
                         add(row, label, source)
@@ -221,11 +214,23 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
                     warnings.append(f"{label} | {source}: {redact_meta_error(exc, all_tokens)}")
             business_counts[(label, business_id)] += len(found_here)
 
+        if not include_me_accounts:
+            continue
+
         # Preserve the existing name-coded accounts that the token can access
         # outside the configured businesses. Do not include unrelated names.
         try:
-            rows = graph_accounts(client.access_token, api_version, "me/adaccounts",
-                                  "id,account_id,name,account_status,currency")
+            try:
+                rows = graph_accounts(client.access_token, api_version, "me/adaccounts",
+                                      META_ACCOUNT_FIELDS, client=client)
+            except RuntimeError as exc:
+                # Only retry with basic fields for a field/permission issue,
+                # not when Meta is already limiting this token.
+                detail = str(exc).lower()
+                if any(x in detail for x in ("code=17", "code=4", "code=32", "code=613", "rate limit", "request limit")):
+                    raise
+                rows = graph_accounts(client.access_token, api_version, "me/adaccounts",
+                                      "id,account_id,name,account_status,currency", client=client)
             for row in rows:
                 name = str(row.get("name") or "").upper()
                 if any(prefix in name for prefix in ACCOUNT_NAME_PREFIXES):
@@ -251,6 +256,7 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
             for key, rows in discovered.items()}, warnings
 
 
+
 def snapshot_failed(frame: pd.DataFrame, expected_account_id: str) -> bool:
     if frame.empty:
         return True
@@ -266,7 +272,18 @@ def fetch_account_with_fallback(account_id: str, candidates: list[tuple[str, dic
     errors: list[str] = []
     first_partial = None
     all_tokens = {label: client.access_token for label, client in clients.items()}
-    for label, row in candidates:
+    # Try the tokens that actually discovered this account first. If all of
+    # them fail because of a NON-quota error, legacy blind fallback can still
+    # rescue an unexpected permission or data-sync issue. Never blindly try
+    # another token once the real issue is a hard Meta quota limit.
+    attempts = list(candidates)
+    known_labels = {label for label, _ in attempts}
+    unproven = [(label, dict(attempts[0][1]))
+                for label in clients if label not in known_labels] if attempts else []
+    index = 0
+    while index < len(attempts):
+        label, row = attempts[index]
+        index += 1
         try:
             frame, details = fetch_full_snapshot(
                 clients[label], pd.DataFrame([row]), max_workers=1, spend_date=spend_date
@@ -279,26 +296,47 @@ def fetch_account_with_fallback(account_id: str, candidates: list[tuple[str, dic
                     first_partial = (frame, details, label)
                 errors.append(f"{label}: partial snapshot: {redact_meta_error(Exception(row_error), all_tokens)}")
                 continue
-            errors.append(f"{label}: account fetch_status=ERROR or no matching row")
+            raw_errors = frame['error'].dropna().astype(str).tolist() if 'error' in frame.columns else []
+            reason = '; '.join(raw_errors) or 'account fetch_status=ERROR or no matching row'
+            safe_reason = redact_meta_error(Exception(reason), all_tokens)
+            errors.append(f"{label}: {safe_reason}")
+            print(f"ALLOCATION FETCH ERROR act_{account_id} via {label}: {safe_reason}")
         except Exception as exc:
             errors.append(f"{label}: {redact_meta_error(exc, all_tokens)}")
+        if index == len(attempts) and unproven:
+            quota_error = any(any(term in reason.lower() for term in (
+                'code=17', 'code=4', 'code=32', 'code=613', 'code=80004',
+                'rate limit', 'request limit', 'rate limited')) for reason in errors)
+            if not quota_error:
+                attempts.extend(unproven)
+            unproven = []
     if first_partial is not None:
         frame, details, label = first_partial
         return frame, details, label, errors
     raise RuntimeError(f"Account act_{account_id} failed for all available tokens: {'; '.join(errors)}")
 
 
+
 def collect_multi_token_snapshot(clients: dict[str, MetaClient], business_ids: list[str],
                                  api_version: str, spend_date,
-                                 max_workers: int) -> tuple[pd.DataFrame, list[dict], list[str]]:
-    discovered, warnings = discover_all_accounts(clients, business_ids, api_version)
+                                 max_workers: int, include_me_accounts: bool = True,
+                                 agent_code: str = 'ALL') -> tuple[pd.DataFrame, list[dict], list[str]]:
+    discovered, warnings = discover_all_accounts(clients, business_ids, api_version, include_me_accounts)
+    # Filtering AFTER all accounts were fetched was extremely costly for a
+    # single-media-buyer request; select the same accounts BEFORE fetching.
+    if agent_code and agent_code.upper() != 'ALL':
+        selected_code = agent_code.strip().upper()
+        discovered = {aid: options for aid, options in discovered.items()
+                      if any(extract_buyer_code(row.get('name')) == selected_code
+                             for _, row in options)}
+        print(f'Allocation scope {selected_code}: {len(discovered)} matching accounts')
     if not discovered:
         raise RuntimeError("No eligible ad accounts discovered from either token. Reports were NOT sent.")
     frames: list[pd.DataFrame] = []
     details: list[dict] = []
     failed: list[str] = []
     token_counts: Counter = Counter()
-    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 10))) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 6))) as executor:
         futures = {executor.submit(fetch_account_with_fallback, account_id, candidates,
                                    clients, spend_date): account_id
                    for account_id, candidates in discovered.items()}
@@ -320,6 +358,7 @@ def collect_multi_token_snapshot(clients: dict[str, MetaClient], business_ids: l
                            + " | ".join(failed[:12]))
     print("Snapshot by token: " + ", ".join(f"{label}={token_counts[label]}" for label in clients))
     return pd.concat(frames, ignore_index=True), details, warnings
+
 
 
 def send_message_chunks(*, config: dict[str, str], recipient: str, body: str, label: str) -> int:
@@ -447,6 +486,14 @@ def main() -> int:
 
     # Build all reports before sending anything. If report generation fails,
     # the workflow exits without partially sending a report batch.
+    # Recharge is about future runway, so only the budget owners still
+    # delivering can consume future credit. Never inflate 3-day recharge by
+    # the already-spent amount from stopped ads / ad sets / campaigns.
+    # Preserve reports.py and every line of its WhatsApp presentation as-is.
+    recharge_snapshot = snapshot_df.copy()
+    if "live_daily_budget" in recharge_snapshot.columns:
+        recharge_snapshot["active_daily_budget"] = recharge_snapshot["live_daily_budget"]
+
     agent_reports: list[tuple[str, str, str, str]] = []
     for code, recipient in AGENT_REPORT_RECIPIENTS.items():
         agent_reports.append(
@@ -454,7 +501,7 @@ def main() -> int:
                 code,
                 recipient,
                 build_agent_message_1(snapshot_df, code),
-                build_agent_message_2(snapshot_df, code),
+                build_agent_message_2(recharge_snapshot, code),
             )
         )
     overall_report = build_overall_report(snapshot_df)
