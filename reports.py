@@ -111,12 +111,18 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
 
     if df.empty:
         lines.append("No ad accounts with Spend Today > 0 and a daily budget were found.")
-        lines.extend(["", f"Overall Daily Budget for {name} ({code}): 0.00 EGP", "Overall Balance: 0.00 EGP"])
+        lines.extend([
+            "",
+            f"Overall Daily Budget for {name} ({code}): 0.00 EGP",
+            f"Overall Live Budget for {name} ({code}): 0.00 EGP",
+            "Overall Balance: 0.00 EGP",
+        ])
         return "\n".join(lines)
 
     for _, row in df.iterrows():
         coverage = row.get("coverage_days")
         daily_budget = float(row.get("active_daily_budget") or 0)
+        live_budget = pd.to_numeric(pd.Series([row.get("live_daily_budget", 0.0)]), errors="coerce").fillna(0).iloc[0]
         balance = row.get("balance")
 
         if coverage is not None and pd.notna(coverage) and float(coverage) <= CRITICAL_COVERAGE_DAYS:
@@ -130,6 +136,7 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
             f"*Ad Account ID:* {row.get('account_id', '-')}",
             f"*Ad Account Name:* {row.get('account_name', '-')}",
             f"*Daily Budget:* {money(daily_budget, row.get('currency', 'EGP'))}",
+            f"*Live Daily Budget:* {money(live_budget, row.get('currency', 'EGP'))}",
             f"*Balance:* {money(balance, row.get('currency', 'EGP'))}",
             f"*Balance Coverage:* {days(coverage)}",
             f"*Alarm:* {alarm}",
@@ -137,10 +144,12 @@ def build_agent_message_1(snapshot_df: pd.DataFrame, code: str) -> str:
         ])
 
     overall_budget = pd.to_numeric(df["active_daily_budget"], errors="coerce").fillna(0).sum()
+    overall_live = pd.to_numeric(df.get("live_daily_budget", pd.Series(0.0, index=df.index)), errors="coerce").fillna(0).sum()
     overall_balance = pd.to_numeric(df["balance"], errors="coerce").fillna(0).sum()
     lines.extend([
         "──────────────",
         f"*Overall Daily Budget for {name} ({code}):* {money(overall_budget)}",
+        f"*Overall Live Budget for {name} ({code}):* {money(overall_live)}",
         f"*Overall Balance:* {money(overall_balance)}",
     ])
     return "\n".join(lines).strip()
@@ -190,9 +199,14 @@ def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | N
     if snapshot_df.empty:
         total_spend = 0.0
         total_daily = 0.0
+        total_live = 0.0
     else:
         total_spend = pd.to_numeric(snapshot_df["spend_today"], errors="coerce").fillna(0).sum()
         total_daily = pd.to_numeric(snapshot_df["active_daily_budget"], errors="coerce").fillna(0).sum()
+        total_live = pd.to_numeric(
+            snapshot_df.get("live_daily_budget", pd.Series(0.0, index=snapshot_df.index)),
+            errors="coerce",
+        ).fillna(0).sum()
 
     spend_vs_allocation = safe_ratio_pct(total_spend, allocation)
     remaining_allocation = allocation - total_spend if allocation > 0 else None
@@ -201,7 +215,8 @@ def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | N
         "📊 *Overall Budget Performance*",
         "",
         f"*Spend Today:* {money(total_spend)}",
-        f"*Daily Budget:* {money(total_daily)}",
+        f"*Overall Daily Budget:* {money(total_daily)}",
+        f"*Overall Live Budget:* {money(total_live)}",
         f"*Allocation Budget:* {money(allocation) if allocation > 0 else 'NOT CONFIGURED'}",
         f"*Spend vs Allocation:* {pct(spend_vs_allocation)}",
         f"*Remaining Allocation:* {money(remaining_allocation) if remaining_allocation is not None else 'N/A'}",
@@ -224,6 +239,10 @@ def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | N
         agent_df = snapshot_df[snapshot_df["buyer_code"] == code].copy()
         spend = pd.to_numeric(agent_df["spend_today"], errors="coerce").fillna(0).sum()
         daily = pd.to_numeric(agent_df["active_daily_budget"], errors="coerce").fillna(0).sum()
+        live = pd.to_numeric(
+            agent_df.get("live_daily_budget", pd.Series(0.0, index=agent_df.index)),
+            errors="coerce",
+        ).fillna(0).sum()
         spend_vs_daily = safe_ratio_pct(spend, daily)
         remaining_daily = daily - spend
         name = MEDIA_BUYER_MAP.get(code, "Unknown")
@@ -231,6 +250,7 @@ def build_overall_report(snapshot_df: pd.DataFrame, allocation_budget: float | N
             "",
             f"*{name} ({code})*",
             f"Daily Budget: {money(daily)}",
+            f"Live Daily Budget: {money(live)}",
             f"Spend Today: {money(spend)}",
             f"Spend vs Daily Budget: {pct(spend_vs_daily)}",
             f"Remaining vs Daily Budget: {money(remaining_daily)}",
