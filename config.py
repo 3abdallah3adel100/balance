@@ -27,6 +27,7 @@ AGENT_REPORT_RECIPIENTS = {
     "AA": "201280871971",
     "HM": "201015177863",
     "BM": "201111901470",
+    "AF": "201098320008",
 }
 
 # Overall management report goes ONLY to these numbers.
